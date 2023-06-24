@@ -27,7 +27,7 @@ import { ContentSecurityPolicy } from "../runtime/csp.ts";
 import { bundleAssetUrl } from "./constants.ts";
 import { assetHashingHook } from "../runtime/utils.ts";
 import { htmlEscapeJsonString } from "./htmlescape.ts";
-import { serialize } from "./serializer.ts";
+import { isVNode, serialize } from "./serializer.ts";
 
 // These hooks are long stable, but when we originally added them we
 // weren't sure if they should be public.
@@ -122,6 +122,8 @@ function defaultCsp() {
   };
 }
 
+let unusedSlots: Array<{ id: string; children: ComponentChildren }> = [];
+
 /**
  * This function renders out a page. Rendering is synchronous and non streaming.
  * Suspense boundaries are not supported.
@@ -189,6 +191,15 @@ export async function render<Data>(
 
   function renderInner(): string {
     bodyHtml = renderToString(vnode);
+
+    console.log("DONE", unusedSlots.length);
+    for (const slot of unusedSlots) {
+      const slotHtml = renderToString(slot.children as any);
+      console.log("SLOT", slotHtml);
+      bodyHtml += `<template id="${slot.id}">${slotHtml}</template>`;
+    }
+    unusedSlots = [];
+
     return bodyHtml;
   }
 
@@ -476,6 +487,8 @@ let ISLAND_PROPS: unknown[] = [];
 let ownerStack: VNode[] = [];
 const islandOwners = new Map<VNode, VNode>();
 
+const islandSymbol = Symbol("fresh-island");
+
 const originalHook = options.vnode;
 let ignoreNext = false;
 options.vnode = (vnode) => {
@@ -518,28 +531,44 @@ options.vnode = (vnode) => {
       vnode.type = (props) => {
         ignoreNext = true;
 
+        const child = h(originalType, props);
+        ISLAND_PROPS.push(props);
+
+        const id = ISLAND_PROPS.length - 1;
+
         // Only passing children JSX to islands is supported for now
         if ("children" in props) {
           const children = props.children;
           // @ts-ignore nonono
           props.children = wrapWithMarker(
             children,
-            `frsh-slot-${island.id}:children`,
+            `frsh-slot-${island.id}:children:${id}`,
           );
         }
 
-        const child = h(originalType, props);
-        ISLAND_PROPS.push(props);
-
         return wrapWithMarker(
           child,
-          `frsh-${island.id}:${ISLAND_PROPS.length - 1}`,
+          `frsh-${island.id}:${id}`,
         );
       };
+
+      // Mark node as island to be able to track it later
+      // when checking if its children did render
+      // deno-lint-ignore no-explicit-any
+      (vnode.type as any)[islandSymbol] = true;
     }
   }
   if (originalHook) originalHook(vnode);
 };
+
+function didVNodeRender(vnode: VNode) {
+  // Check if a vnode was rendered. We do that by checking
+  // if the parent pointer was set. If it was rendered that
+  // will point to a VNode. If it's null than the vnode was
+  // not rendered.
+  // deno-lint-ignore no-explicit-any
+  return (vnode as any).__ !== null;
+}
 
 // Keep track of owners
 const oldDiffed = options.diffed;
@@ -558,6 +587,56 @@ options.diffed = (vnode) => {
   if (typeof vnode.type === "function") {
     if (vnode.type !== Fragment) {
       ownerStack.pop();
+
+      if (islandSymbol in vnode.type) {
+        const children = vnode.props.children;
+
+        // Check if the island children were rendered or not.
+        // If not than we send them down as a template tag in
+        // case the island will render them at a later point
+        if (
+          // TODO: Simplify, we are only dealing with markers here
+          children !== null && children !== undefined &&
+          (!isVNode(children) || (!didVNodeRender(children)) || (
+            Array.isArray(children) && children.length > 0 &&
+            (!isVNode(children) ||
+              !didVNodeRender(children[0]))
+          ))
+        ) {
+          // Now we now that the island children did not render.
+          // Grab the island id and index which acts as a
+          // unique id on the client.
+          if (
+            isVNode(children) && children.type === Fragment &&
+            Array.isArray(children.props.children) &&
+            children.props.children[0].type === Fragment &&
+            "UNSTABLE_comment" in children.props.children[0].props
+          ) {
+            const comment = children.props.children[0].props
+              .UNSTABLE_comment as string;
+            const match = comment.match(
+              /^frsh-slot-([\w_-]+):children:(\d+)$/,
+            );
+
+            if (match) {
+              const island = match[1];
+              const idx = match[2];
+              unusedSlots.push({
+                id: `frsh-${island}-${idx}`,
+                children: children.props.children[1],
+              });
+            }
+          } else if (
+            isVNode(children) && typeof children.type === "string" &&
+            children.type.startsWith("!--")
+          ) {
+            // FIXME
+            unusedSlots.push({ id: "TODO", children });
+          }
+
+          // console.log(children);
+        }
+      }
     }
   }
   oldDiffed?.(vnode);

@@ -205,7 +205,36 @@ function _walkInner(
               children.push(child);
             }
 
-            const vnode = vnodeStack.pop();
+            const vnode = vnodeStack[vnodeStack.length - 1];
+
+            if (vnode.props.children == null) {
+              const sel = `#${marker.text.replace(":", "-")}`;
+              const template = document.querySelector(sel) as
+                | HTMLTemplateElement
+                | null;
+
+              if (template !== null) {
+                markerStack.push({
+                  kind: MarkerKind.Slot,
+                  endNode: null,
+                  startNode: null as any,
+                  text: "foo",
+                });
+
+                const node = template.content.cloneNode(true);
+                // TODO: Has island DOM
+                _walkInner(
+                  islands,
+                  props,
+                  markerStack,
+                  vnodeStack,
+                  node,
+                );
+
+                markerStack.pop();
+              }
+            }
+            vnodeStack.pop();
 
             const parentNode = sib.parentNode! as HTMLElement;
 
